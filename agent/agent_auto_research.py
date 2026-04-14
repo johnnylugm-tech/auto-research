@@ -198,6 +198,25 @@ class AgentDrivenAutoResearch:
         self.target_score = self.PHASE_CONFIG.get(phase, self.PHASE_CONFIG[3])['target']
         self.pass_score = self.PHASE_CONFIG.get(phase, self.PHASE_CONFIG[3])['pass']
         
+
+    def _initialize_circuit_breaker(self) -> None:
+        """初始化熔斷狀態"""
+        self._circuit_breaker_state = {
+            'failed_dimensions': {},
+            'consecutive_failures': {},
+            'last_success': {}
+        }
+        # 嘗試從歷史檔案載入
+        history_file = self.project_path / ".auto_research_history.json"
+        if history_file.exists():
+            try:
+                import json
+                with open(history_file, 'r') as f:
+                    history = json.load(f)
+                    self._circuit_breaker_state.update(history)
+            except Exception:
+                pass
+
     def load_history(self) -> Dict:
         if self.history_file.exists():
             with open(self.history_file) as f:
