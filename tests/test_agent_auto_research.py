@@ -208,3 +208,34 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+def test_timed_operation_warning():
+    """Test _timed_operation when operation exceeds threshold"""
+    agent = MagicMock()
+    agent._timed_operation = AgentDrivenAutoResearch._timed_operation.__get__(agent, MagicMock)
+    
+    def slow_func():
+        import time
+        time.sleep(0.1)
+        return "done"
+    
+    # Should complete without error
+    result = agent._timed_operation("test_operation", slow_func)
+    assert result == "done"
+    print("✅ test_timed_operation_warning PASSED")
+
+
+def test_timed_operation_error():
+    """Test _timed_operation when operation raises exception"""
+    agent = MagicMock()
+    agent._timed_operation = AgentDrivenAutoResearch._timed_operation.__get__(agent, MagicMock)
+    
+    def error_func():
+        raise ValueError("Test error")
+    
+    try:
+        agent._timed_operation("error_operation", error_func)
+        assert False, "Should have raised"
+    except ValueError as e:
+        assert "Test error" in str(e)
+    print("✅ test_timed_operation_error PASSED")
