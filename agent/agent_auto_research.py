@@ -526,104 +526,192 @@ Run these commands to verify:
     # ============================================================================
 
     def run(self, max_iterations: int = 3, auto_commit: bool = True, 
-               save_dashboard: bool = True, verbose: bool = True) -> Dict:
-        """
-        運行 Agent-Driven AutoResearch Loop
+               save_dashboard: bool = True) -> Dict[str, Any]:
+        """主入口：協調執行流程（帶熔斷機制）"""
+        print(f"\n{'=' * 60}")
+        print(f"🚀 開始 Auto Research: {self.project_path.name}")
+        print(f"   目標分數: {self.target_score}")
+        print(f"   最大迭代: {max_iterations}")
+        print(f"{'=' * 60}")
         
-        Args:
-            max_iterations: 最大迭代次數
-            
-        Returns:
-            最终報告字典
-        """
-        print("\n" + "=" * 70)
-        print("🚀 Agent-Driven AutoResearch Loop 啟動")
-        print("=" * 70)
-        print(f"專案: {self.project_path.name}")
-        print(f"Phase: {self.phase}")
-        print(f"活躍維度: {', '.join(self.active_dims)}")
-        print(f"目標: {self.target_score}% (及格: {self.pass_score}%)")
-        print(f"最大迭代: {max_iterations}")
-        print("=" * 70)
-        
-        history = self.load_history()
-        baseline = history.get("baseline", {})
+        try:
+            return self._run_with_circuit_breaker(max_iterations, auto_commit, save_dashboard)
+        except Exception as e:
+            print(f"\n❌ Run 執行失敗: {e}")
+            return self._generate_error_report(str(e))
+
+    def _run_with_circuit_breaker(self, max_iterations: int, auto_commit: bool, 
+                                   save_dashboard: bool) -> Dict[str, Any]:
+        """帶熔斷機制的執行流程"""
+        history = self._load_history()
+        failed_dimensions = history.get('failed_dimensions', {})
         
         for iteration in range(1, max_iterations + 1):
-            print(f"\n{'━' * 70}")
+            print(f"\n{'=' * 50}")
             print(f"📍 迭代 {iteration}/{max_iterations}")
-            print(f"{'━' * 70}")
+            print(f"{'=' * 50}")
             
-            # Step 1: 評估當前狀態
-            current_scores = self._evaluate_all_dimensions()
+            baseline_scores = self._evaluate_baseline()
+            if baseline_scores is None:
+                print("⚠️ 無法獲取基線分數，跳過此迭代")
+                continue
             
-            if iteration == 1 and not baseline:
-                baseline = current_scores.copy()
-                history["baseline"] = baseline
-            
-            print(f"\n📊 當前分數:")
-            for dim, score in sorted(current_scores.items()):
-                target_met = "✅" if score >= 85 else "⚠️"
-                print(f"   {target_met} {dim}: {score:.1f}%")
-            
-            total_score = sum(current_scores.values()) / len(current_scores)
-            print(f"\n   總分: {total_score:.1f}%")
-            
-            # Step 2: 檢查是否達標
-            if total_score >= self.target_score:
-                print(f"\n🎉 達成目標分數 {self.target_score}%！")
-                break
-            
-            # Step 3: 識別需要改進的維度
-            low_dims = [(d, s) for d, s in current_scores.items() if s < 85]
-            low_dims.sort(key=lambda x: x[1])  # 按分數排序，最低分優先
-            
-            if not low_dims:
+            if self._check_target_reached(baseline_scores):
                 print("✅ 所有維度都已達標")
                 break
             
-            print(f"\n🔍 需要改進的維度:")
+            low_dims = self._identify_low_dims_with_circuit(baseline_scores, failed_dimensions)
+            if not low_dims:
+                print("✅ 所有可改進的維度都已處理")
+                break
+            
+            print(f"\n🔍 需要改進的維度 (共 {len(low_dims)} 個):")
             for dim, score in low_dims[:3]:
                 print(f"   - {dim}: {score:.1f}%")
             
-            # Step 4: 為每個維度調用 Agent
-            agent_results = []
+            agent_results = self._run_agents_with_circuit(low_dims, failed_dimensions)
+            self._update_circuit_breaker_state(agent_results, failed_dimensions)
             
-            for dim, score in low_dims:  # 所有低於目標的維度都處理
-                print(f"\n{'─' * 50}")
-                print(f"🤖 Agent 處理: {dim}")
-                print(f"{'─' * 50}")
-                
-                result = self._run_agent_for_dimension(dim, score)
-                agent_results.append(result)
-                
-                if result.success:
-                    print(f"   ✅ 成功！提升: +{result.improvement:.1f}%")
-                else:
-                    print(f"   ❌ 失敗: {result.error}")
-            
-            # Step 5: 記錄迭代結果
-            total_improvement = sum(r.improvement for r in agent_results)
+            total_improvement = sum(r.improvement for r in agent_results if r.success)
             iteration_record = IterationRecord(
                 iteration=iteration,
                 timestamp=datetime.now().isoformat(),
                 agent_results=agent_results,
                 total_improvement=total_improvement,
-                dimensions_status=current_scores
+                dimensions_status=baseline_scores
             )
             self.records.append(iteration_record)
             
             print(f"\n📋 迭代 {iteration} 總結:")
             print(f"   總改進: {'+' if total_improvement >= 0 else ''}{total_improvement:.1f}%")
+            print(f"   成功: {sum(1 for r in agent_results if r.success)}/{len(agent_results)}")
             
-            # 如果沒有任何改進，停止
-            if total_improvement == 0 and all(not r.success for r in agent_results):
-                print("\n⚠️ 連續無改進，停止迭代")
+            if self._should_stop_iteration(agent_results, total_improvement):
+                print("\n⚠️ 停止迭代條件觸發")
                 break
         
-        # 生成最終報告
         return self._generate_final_report()
-    
+
+    def _load_history(self) -> Dict[str, Any]:
+        """載入歷史記錄，獲取熔斷狀態"""
+        history_file = self.project_path / ".auto_research_history.json"
+        if history_file.exists():
+            try:
+                import json
+                with open(history_file, 'r') as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {'failed_dimensions': {}}
+
+    def _evaluate_baseline(self) -> Optional[Dict[str, float]]:
+        """評估基線分數（可獨立失敗）"""
+        try:
+            return self._evaluate_all_dimensions()
+        except Exception as e:
+            print(f"⚠️ 基線評估失敗: {e}")
+            return None
+
+    def _check_target_reached(self, scores: Dict[str, float]) -> bool:
+        """檢查是否所有維度都達標"""
+        total_score = sum(scores.values())
+        avg_score = total_score / len(scores) if scores else 0
+        return avg_score >= self.target_score
+
+    def _identify_low_dims_with_circuit(self, scores: Dict[str, float], 
+                                        failed_dimensions: Dict[str, int]) -> List[Tuple[str, float]]:
+        """識別需要改進的維度（考慮熔斷狀態）"""
+        low_dims = []
+        for dim, score in scores.items():
+            if score < 85:
+                failure_count = failed_dimensions.get(dim, 0)
+                if failure_count >= 2:
+                    print(f"   ⏭️ 跳過 {dim} (熔斷: 連續失敗 {failure_count} 次)")
+                    continue
+                low_dims.append((dim, score))
+        low_dims.sort(key=lambda x: x[1])
+        return low_dims
+
+    def _run_agents_with_circuit(self, low_dims: List[Tuple[str, float]], 
+                                 failed_dimensions: Dict[str, int]) -> List[AgentResult]:
+        """為多個維度執行 Agent（帶熔斷）"""
+        agent_results = []
+        for dim, score in low_dims:
+            print(f"\n{'─' * 50}")
+            print(f"🤖 Agent 處理: {dim}")
+            print(f"   当前分数: {score:.1f}%")
+            print(f"   熔斷次數: {failed_dimensions.get(dim, 0)}")
+            print(f"{'─' * 50}")
+            
+            try:
+                result = self._run_agent_for_dimension(dim, score)
+                agent_results.append(result)
+                print(f"   {'✅ 成功！提升: +' if result.success else '❌ 失敗: '}{result.improvement if result.success else result.error}")
+            except Exception as e:
+                print(f"   ❌ 異常: {e}")
+                result = AgentResult(success=False, dimension=dim, improvement=0, error=str(e), agent_output="", execution_time=0)
+                agent_results.append(result)
+        return agent_results
+
+    def _update_circuit_breaker_state(self, agent_results: List[AgentResult],
+                                      failed_dimensions: Dict[str, int]) -> None:
+        """更新熔斷狀態"""
+        for result in agent_results:
+            dim = result.dimension
+            if result.success:
+                if dim in failed_dimensions:
+                    del failed_dimensions[dim]
+                self._save_dimension_success(dim, result.improvement)
+            else:
+                failed_dimensions[dim] = failed_dimensions.get(dim, 0) + 1
+        self._save_circuit_breaker_state(failed_dimensions)
+
+    def _should_stop_iteration(self, agent_results: List[AgentResult], 
+                               total_improvement: float) -> bool:
+        """判斷是否應該停止迭代"""
+        if total_improvement == 0 and all(not r.success for r in agent_results):
+            return True
+        return False
+
+    def _save_circuit_breaker_state(self, failed_dimensions: Dict[str, int]) -> None:
+        """保存熔斷狀態到檔案"""
+        history_file = self.project_path / ".auto_research_history.json"
+        try:
+            import json
+            history = {'failed_dimensions': failed_dimensions}
+            with open(history_file, 'w') as f:
+                json.dump(history, f)
+        except Exception:
+            pass
+
+    def _save_dimension_success(self, dimension: str, improvement: float) -> None:
+        """記錄 dimension 改進成功"""
+        history_file = self.project_path / ".auto_research_history.json"
+        try:
+            import json
+            if history_file.exists():
+                with open(history_file, 'r') as f:
+                    history = json.load(f)
+            else:
+                history = {}
+            if 'successful_improvements' not in history:
+                history['successful_improvements'] = {}
+            history['successful_improvements'][dimension] = improvement
+            with open(history_file, 'w') as f:
+                json.dump(history, f)
+        except Exception:
+            pass
+
+    def _generate_error_report(self, error: str) -> Dict[str, Any]:
+        """生成錯誤報告"""
+        return {
+            'success': False,
+            'error': error,
+            'iterations': len(self.records),
+            'total_improvement': sum(r.total_improvement for r in self.records) if self.records else 0,
+            'records': []
+        }
+
     def _evaluate_all_dimensions(self) -> Dict[str, float]:
         """評估所有 9 維度"""
         # 運行 dashboard 獲取分數
