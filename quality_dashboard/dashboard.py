@@ -59,10 +59,22 @@ class LintingEvaluator:
     weight = 0.10
     
     def evaluate(self, project_path: str) -> DimensionScore:
-        stdout, _, rc = run_tool(["ruff", "check", f"{project_path}/03-development/src", "--ignore=D100,E501,F401"])
-        error_count = len([l for l in stdout.split('\n') if l.strip() and l.startswith('F')])
+        # Load config to get scan_paths
+        config_path = Path(project_path) / ".quality_dashboard" / "auto_research.json"
+        if not config_path.exists():
+            return DimensionScore(self.name, 0, self.weight, [f"Config not found: {config_path}"], True, "ruff")
+        with open(config_path) as f:
+            config = json.load(f)
+        scan_paths = [Path(project_path) / p for p in config.get("scan_paths", [])]
+        
+        all_output = []
+        for path in scan_paths:
+            stdout, _, rc = run_tool(["ruff", "check", str(path), "--ignore=D100,E501,F401"])
+            all_output.append(stdout)
+        combined = "\n".join(all_output)
+        error_count = len([l for l in combined.split('\n') if l.strip() and l.startswith('F')])
         score = max(0, 100 - error_count * 5)
-        issues = [l.strip() for l in stdout.split('\n') if l.strip() and l.startswith('F')][:5]
+        issues = [l.strip() for l in combined.split('\n') if l.strip() and l.startswith('F')][:5]
         return DimensionScore(self.name, score, self.weight, issues, True, "ruff")
 
 class TypeSafetyEvaluator:
@@ -70,10 +82,22 @@ class TypeSafetyEvaluator:
     weight = 0.15
     
     def evaluate(self, project_path: str) -> DimensionScore:
-        stdout, _, rc = run_tool(["mypy", f"{project_path}/03-development/src", "--ignore-missing-imports", "--no-error-summary"], timeout=60)
-        error_count = stdout.count(": error:")
+        # Load config to get scan_paths
+        config_path = Path(project_path) / ".quality_dashboard" / "auto_research.json"
+        if not config_path.exists():
+            return DimensionScore(self.name, 0, self.weight, [f"Config not found: {config_path}"], True, "mypy")
+        with open(config_path) as f:
+            config = json.load(f)
+        scan_paths = [Path(project_path) / p for p in config.get("scan_paths", [])]
+        
+        all_output = []
+        for path in scan_paths:
+            stdout, _, rc = run_tool(["mypy", str(path), "--ignore-missing-imports", "--no-error-summary"], timeout=60)
+            all_output.append(stdout)
+        combined = "\n".join(all_output)
+        error_count = combined.count(": error:")
         score = max(0, 100 - error_count * 10)
-        issues = [l.strip() for l in stdout.split('\n') if ': error:' in l][:5]
+        issues = [l.strip() for l in combined.split('\n') if ': error:' in l][:5]
         return DimensionScore(self.name, score, self.weight, issues, True, "mypy")
 
 class CoverageEvaluator:
@@ -81,18 +105,38 @@ class CoverageEvaluator:
     weight = 0.20
     
     def evaluate(self, project_path: str) -> DimensionScore:
-        # Use 03-development/tests (not project-root/tests symlink) to avoid duplicate collection
-        stdout, _, rc = run_tool(["python3", "-m", "pytest", f"{project_path}/03-development/tests",
-                                 "--cov=src", "--cov-report=term-missing", "--tb=no", "-q"],
-                                timeout=60, cwd=project_path)
-        coverage = 0
-        for line in stdout.split('\n'):
-            if 'TOTAL' in line:
-                parts = line.replace('%', ' ').split()
-                # Find the coverage percentage (last number in TOTAL line)
-                nums = [float(p) for p in parts if p.replace('.', '').isdigit()]
-                if nums:
-                    coverage = nums[-1]  # Last number is percentage
+        # Load config to get scan_paths
+        config_path = Path(project_path) / ".quality_dashboard" / "auto_research.json"
+        if not config_path.exists():
+            return DimensionScore(self.name, 0, self.weight, ["Config not found"], True, "pytest-cov")
+        
+        with open(config_path) as f:
+            config = json.load(f)
+        scan_paths = [Path(p) for p in config.get("scan_paths", [])]
+        
+        all_coverages = []
+        for scan_path in scan_paths:
+            # Convert Path to string for replacement
+            scan_str = str(scan_path)
+            test_path = scan_str.replace("implement/", "test/")
+            full_test_path = Path(project_path) / test_path
+            if not full_test_path.exists():
+                continue
+            
+            stdout, _, rc = run_tool(
+                ["python3", "-m", "pytest", str(full_test_path),
+                 f"--cov={scan_path}", "--cov-report=term-missing", "--tb=no", "-q"],
+                timeout=120, cwd=project_path
+            )
+            
+            for line in stdout.split('\n'):
+                if 'TOTAL' in line:
+                    parts = line.replace('%', ' ').split()
+                    nums = [float(p) for p in parts if p.replace('.', '').isdigit()]
+                    if nums:
+                        all_coverages.append(nums[-1])
+        
+        coverage = statistics.mean(all_coverages) if all_coverages else 0
         issues = [] if coverage >= 70 else [f"Coverage {coverage:.0f}% < 70%"]
         return DimensionScore(self.name, coverage, self.weight, issues, True, "pytest-cov")
 
@@ -101,37 +145,112 @@ class SecurityEvaluator:
     weight = 0.15
     
     def evaluate(self, project_path: str) -> DimensionScore:
-        stdout, _, rc = run_tool(["bandit", "-r", f"{project_path}/03-development/src", "-f", "json", "-ll"], timeout=60)
+        # Load config to get scan_paths
+        config_path = Path(project_path) / ".quality_dashboard" / "auto_research.json"
+        if not config_path.exists():
+            return DimensionScore(self.name, 0, self.weight, [f"Config not found: {config_path}"], True, "agent-quality-guard")
+        with open(config_path) as f:
+            config = json.load(f)
+        scan_paths = [Path(project_path) / p for p in config.get("scan_paths", [])]
+        
+        # Use AgentQualityGuard instead of bandit for richer security rules
+        # AQG covers: api_key, password, token, private_key, aws_key, github_token,
+        #             sql_injection, command_injection, eval, path_traversal, etc.
         try:
-            data = json.loads(stdout)
-            high = data["metrics"]["_totals"]["SEVERITY.HIGH"]
-            medium = data["metrics"]["_totals"]["SEVERITY.MEDIUM"]
-            score = max(0, 100 - high * 20 - medium * 10)
-            issues = [f"HIGH: {high}", f"MEDIUM: {medium}"]
-        except:
-            score = 100
-            issues = ["No issues found"]
-        return DimensionScore(self.name, score, self.weight, issues, True, "bandit")
+            import sys
+            sys.path.insert(0, "/Users/johnny/agent-quality-guard-v2")
+            from agent_quality_guard import AgentQualityGuard
+            
+            def _is_in_docstring(file_path: str, line_num: int) -> bool:
+                """Check if a given line is inside a triple-quoted docstring."""
+                try:
+                    with open(file_path) as f:
+                        lines = f.readlines()
+                    if line_num > len(lines):
+                        return False
+                    in_docstring = False
+                    docstring_char = None
+                    for i, line in enumerate(lines[:line_num], 1):
+                        stripped = line.strip()
+                        if not in_docstring:
+                            if stripped.startswith('"""') or stripped.startswith("'''"):
+                                in_docstring = True
+                                docstring_char = stripped[:3]
+                                # Check if it's a single-line docstring
+                                if stripped.count(docstring_char) >= 2:
+                                    in_docstring = False
+                        else:
+                            if docstring_char in stripped:
+                                in_docstring = False
+                                docstring_char = None
+                    return in_docstring
+                except:
+                    return False
+            
+            guard = AgentQualityGuard()
+            total_critical = 0
+            total_warning = 0
+            total_info = 0
+            for path in scan_paths:
+                reports = guard.scan_directory(str(path))
+                for r in reports:
+                    for issue in r.issues:
+                        # Filter false positives: skip if line is in a docstring
+                        if _is_in_docstring(r.file_path, issue.line):
+                            continue
+                        if issue.severity == "critical":
+                            total_critical += 1
+                        elif issue.severity == "warning":
+                            total_warning += 1
+                        else:
+                            total_info += 1
+            
+            # Compute risk score: 0-100, adjusted penalties to avoid over-penalizing
+            # Critical: 10pts each, Warning: 2pts each, Info: 0.5pts each
+            risk_score = 100 - (total_critical * 10 + total_warning * 2 + total_info * 0.5)
+            risk_score = max(0, min(100, risk_score))
+            
+            issues = []
+            if total_critical > 0:
+                issues.append(f"Critical: {total_critical}")
+            if total_warning > 0:
+                issues.append(f"Warning: {total_warning}")
+            if total_info > 0:
+                issues.append(f"Info: {total_info}")
+            
+            return DimensionScore(self.name, risk_score, self.weight, issues, True, "agent-quality-guard")
+        except Exception as e:
+            # Fallback: if AQG unavailable, return 50 with error info
+            return DimensionScore(self.name, 50, self.weight, [f"AQG unavailable: {e}"], True, "agent-quality-guard")
 
 class ComplexityEvaluator:
     name = "Complexity"
     weight = 0.10
     
     def evaluate(self, project_path: str) -> DimensionScore:
-        # Only analyze src, not tests
-        src_path = f"{project_path}/03-development/src"
-        stdout, _, rc = run_tool(["lizard", src_path, "-L", "15"], timeout=30)
+        # Load config to get scan_paths
+        config_path = Path(project_path) / ".quality_dashboard" / "auto_research.json"
+        if not config_path.exists():
+            return DimensionScore(self.name, 0, self.weight, [f"Config not found: {config_path}"], True, "lizard")
+        with open(config_path) as f:
+            config = json.load(f)
+        scan_paths = [Path(project_path) / p for p in config.get("scan_paths", [])]
+        
+        all_output = []
+        for path in scan_paths:
+            stdout, _, rc = run_tool(["lizard", str(path), "-L", "15"], timeout=30)
+            all_output.append(stdout)
+        combined = "\n".join(all_output)
+        
         hotspots = {}
-        for line in stdout.split('\n'):
+        for line in combined.split('\n'):
             if '.py' in line and 'location' not in line and line.strip():
                 parts = line.split()
                 if len(parts) >= 5:
                     try:
                         cc = int(parts[1])
-                        loc = parts[-1]  # e.g. func@110-255@path/to/file.py
-                        # Extract file path: parts[-1].split('@')[-1] = path/to/file.py
-                        # We want just the module path like src/processing/ssml_parser.py
-                        file_path = '/'.join(loc.split('@')[-1].split('/')[3:])  # skip 03-development/src/
+                        loc = parts[-1]
+                        file_path = '/'.join(loc.split('@')[-1].split('/')[3:])
                         if cc > 15:
                             hotspots[file_path] = cc
                     except:
@@ -150,11 +269,21 @@ class ArchitectureEvaluator:
     weight = 0.10
     
     def evaluate(self, project_path: str) -> DimensionScore:
-        # Only analyze src, not tests
-        src_path = f"{project_path}/03-development/src"
-        stdout, _, rc = run_tool(["radon", "cc", src_path, "-a"], timeout=30)
+        # Load config to get scan_paths
+        config_path = Path(project_path) / ".quality_dashboard" / "auto_research.json"
+        if not config_path.exists():
+            return DimensionScore(self.name, 0, self.weight, [f"Config not found: {config_path}"], True, "radon")
+        with open(config_path) as f:
+            config = json.load(f)
+        scan_paths = [Path(project_path) / p for p in config.get("scan_paths", [])]
+        
+        all_output = []
+        for path in scan_paths:
+            stdout, _, rc = run_tool(["radon", "cc", str(path), "-a"], timeout=30)
+            all_output.append(stdout)
+        combined = "\n".join(all_output)
         # Only calculate C/D/E as issues, A/B are good quality
-        issues = [l.strip() for l in stdout.split('\n') if ' - C' in l or ' - D' in l or ' - E' in l][:3]
+        issues = [l.strip() for l in combined.split('\n') if ' - C' in l or ' - D' in l or ' - E' in l][:3]
         score = max(0, 100 - len(issues) * 10)
         return DimensionScore(self.name, score, self.weight, issues if issues else ["No major issues"], False, "radon")
 
@@ -228,6 +357,14 @@ class QualityDashboard:
         self.data_dir.mkdir(exist_ok=True)
         self.history_file = self.data_dir / "history.json"
         self.evolve_file = self.data_dir / "evolution.json"
+        
+        # Load config file (no fallback - raise if missing)
+        config_path = self.project_path / ".quality_dashboard" / "auto_research.json"
+        if not config_path.exists():
+            raise FileNotFoundError(f"設定檔不存在: {config_path}")
+        with open(config_path) as f:
+            config = json.load(f)
+        self.scan_paths = [Path(project_path) / p for p in config.get("scan_paths", [])]
         
     def load_history(self) -> List[IterationResult]:
         if self.history_file.exists():

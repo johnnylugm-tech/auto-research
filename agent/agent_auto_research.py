@@ -188,15 +188,22 @@ class AgentDrivenAutoResearch:
     
     def __init__(self, project_path: str, phase: int = 3):
         self.project_path = Path(project_path)
-        self.src_path = self.project_path / "03-development" / "src"
         self.data_dir = self.project_path / ".quality_dashboard"
         self.data_dir.mkdir(exist_ok=True)
         self.history_file = self.data_dir / "agent_history.json"
         self.records: List[IterationRecord] = []
         self.phase = phase
         self.active_dims = self.PHASE_CONFIG.get(phase, self.PHASE_CONFIG[3])['dimensions']
-        self.target_score = self.PHASE_CONFIG.get(phase, self.PHASE_CONFIG[3])['target']
 
+        # Load config file (no fallback - raise if missing)
+        config_path = self.project_path / ".quality_dashboard" / "auto_research.json"
+        if not config_path.exists():
+            raise FileNotFoundError(f"設定檔不存在: {config_path}")
+        with open(config_path) as f:
+            config = json.load(f)
+        self.scan_paths = [Path(p) for p in config.get("scan_paths", [])]
+        self.target_score = config.get("target_score", 85)
+        self.pass_score = config.get("pass_score", 70)
 
     def _timed_operation(self, operation_name: str, func, *args, **kwargs):
         """包裝操作以測量執行時間和記錄警告"""
@@ -212,7 +219,6 @@ class AgentDrivenAutoResearch:
             elapsed = time.time() - start
             print(f"⚠️ {operation_name} 失敗 (耗時 {elapsed:.1f}s): {e}")
             raise
-        self.pass_score = self.PHASE_CONFIG.get(phase, self.PHASE_CONFIG[3])['pass']
         
     def load_history(self) -> Dict:
         if self.history_file.exists():
@@ -383,34 +389,50 @@ Scores:
         }
         
         if dimension == "D1_Linting":
-            out, err, rc = self._run_tool_capture(["ruff", "check", "03-development/src/"])
-            counts["before"] = len([l for l in out.split('\n') if l.strip() and not l.startswith('#')])
-            counts["issue_list"] = [l for l in out.split('\n') if l.strip() and ':' in l][:10]  # First 10
-            counts["tool_output"] = out[:500]  # First 500 chars
+            all_output = []
+            for path in self.scan_paths:
+                out, err, rc = self._run_tool_capture(["ruff", "check", str(path)])
+                all_output.append(out)
+            combined = "\n".join(all_output)
+            counts["before"] = len([l for l in combined.split('\n') if l.strip() and not l.startswith('#')])
+            counts["issue_list"] = [l for l in combined.split('\n') if l.strip() and ':' in l][:10]
+            counts["tool_output"] = combined[:500]
             
         elif dimension == "D2_TypeSafety":
-            out, err, rc = self._run_tool_capture(["python3", "-m", "mypy", "03-development/src/"])
-            counts["before"] = len([l for l in out.split('\n') if 'error:' in l or 'warning:' in l])
-            counts["issue_list"] = [l for l in out.split('\n') if 'error:' in l][:10]
-            counts["tool_output"] = out[:500]
+            all_output = []
+            for path in self.scan_paths:
+                out, err, rc = self._run_tool_capture(["python3", "-m", "mypy", str(path)])
+                all_output.append(out)
+            combined = "\n".join(all_output)
+            counts["before"] = len([l for l in combined.split('\n') if 'error:' in l or 'warning:' in l])
+            counts["issue_list"] = [l for l in combined.split('\n') if 'error:' in l][:10]
+            counts["tool_output"] = combined[:500]
             
         elif dimension == "D4_Security":
-            out, err, rc = self._run_tool_capture(["bandit", "-r", "03-development/src/", "-f", "json"])
+            all_output = []
+            for path in self.scan_paths:
+                out, err, rc = self._run_tool_capture(["bandit", "-r", str(path), "-f", "json"])
+                all_output.append(out)
+            combined = "\n".join(all_output)
             try:
                 import json
-                data = json.loads(out)
+                data = json.loads(combined)
                 counts["before"] = len(data.get("results", []))
                 counts["issue_list"] = [f"{r['filename']}:{r['line']} {r['issue_text']}" 
                                        for r in data.get("results", [])[:10]]
             except:
-                counts["before"] = out.count("CONFIDENCE")
-            counts["tool_output"] = out[:500]
+                counts["before"] = combined.count("CONFIDENCE")
+            counts["tool_output"] = combined[:500]
             
         elif dimension == "D5_Complexity":
-            out, err, rc = self._run_tool_capture(["lizard", "03-development/src/"])
-            counts["before"] = len([l for l in out.split('\n') if 'CCN' in l])
-            counts["issue_list"] = [l for l in out.split('\n') if 'CCN' in l][:10]
-            counts["tool_output"] = out[:500]
+            all_output = []
+            for path in self.scan_paths:
+                out, err, rc = self._run_tool_capture(["lizard", str(path)])
+                all_output.append(out)
+            combined = "\n".join(all_output)
+            counts["before"] = len([l for l in combined.split('\n') if 'CCN' in l])
+            counts["issue_list"] = [l for l in combined.split('\n') if 'CCN' in l][:10]
+            counts["tool_output"] = combined[:500]
             
         else:
             counts["tool_output"] = "No tool for this dimension"
@@ -490,11 +512,11 @@ Total improvement: {sum(after.values()) - sum(baseline.values()):.1f}%
 {issues_text}
 
 === VERIFICATION ===
-Run these commands to verify:
-- Linting: ruff check 03-development/src/
-- Type: python3 -m mypy 03-development/src/
-- Security: bandit -r 03-development/src/
-- Complexity: lizard 03-development/src/
+Run these commands to verify (check .quality_dashboard/auto_research.json for scan_paths):
+- Linting: ruff check <scan_paths>
+- Type: python3 -m mypy <scan_paths>
+- Security: bandit -r <scan_paths>
+- Complexity: lizard <scan_paths>
 
 [skip ci] AutoResearch automated commit"""
 
@@ -504,21 +526,33 @@ Run these commands to verify:
         """Capture all tool outputs for transparency"""
         outputs = {}
         
-        # Linting
-        out, _, _ = self._run_tool_capture(["ruff", "check", "03-development/src/"])
-        outputs["ruff"] = out[:1000]
+        # Linting - iterate all scan_paths
+        all_ruff = []
+        for path in self.scan_paths:
+            out, _, _ = self._run_tool_capture(["ruff", "check", str(path)])
+            all_ruff.append(out)
+        outputs["ruff"] = "\n".join(all_ruff)[:1000]
         
-        # Type checking
-        out, _, _ = self._run_tool_capture(["python3", "-m", "mypy", "03-development/src/"])
-        outputs["mypy"] = out[:1000]
+        # Type checking - iterate all scan_paths
+        all_mypy = []
+        for path in self.scan_paths:
+            out, _, _ = self._run_tool_capture(["python3", "-m", "mypy", str(path)])
+            all_mypy.append(out)
+        outputs["mypy"] = "\n".join(all_mypy)[:1000]
         
-        # Security
-        out, _, _ = self._run_tool_capture(["bandit", "-r", "03-development/src/", "-f", "json"])
-        outputs["bandit"] = out[:1000]
+        # Security - iterate all scan_paths
+        all_bandit = []
+        for path in self.scan_paths:
+            out, _, _ = self._run_tool_capture(["bandit", "-r", str(path), "-f", "json"])
+            all_bandit.append(out)
+        outputs["bandit"] = "\n".join(all_bandit)[:1000]
         
-        # Complexity
-        out, _, _ = self._run_tool_capture(["lizard", "03-development/src/"])
-        outputs["lizard"] = out[:1000]
+        # Complexity - iterate all scan_paths
+        all_lizard = []
+        for path in self.scan_paths:
+            out, _, _ = self._run_tool_capture(["lizard", str(path)])
+            all_lizard.append(out)
+        outputs["lizard"] = "\n".join(all_lizard)[:1000]
         
         return outputs
 
@@ -674,30 +708,45 @@ for k, v in result.dimensions.items():
         # 簡單的備用評估邏輯
         scores = {}
         
-        # D1: Linting
-        r1 = subprocess.run(["ruff", "check", str(self.project_path), "--ignore=D100,E501,F401"],
-                          capture_output=True, text=True)
-        scores["D1_Linting"] = 100 if not r1.stdout.strip() else 85
+        # D1: Linting - 遍歷所有 scan_paths
+        total_errors = 0
+        for path in self.scan_paths:
+            r1 = subprocess.run(["ruff", "check", str(self.project_path / path), "--ignore=D100,E501,F401"],
+                              capture_output=True, text=True)
+            # Count F errors only (not D/W/I)
+            error_lines = [l for l in r1.stdout.split('\n') if l.strip() and l[0] == 'F']
+            total_errors += len(error_lines)
+        scores["D1_Linting"] = max(0, 100 - total_errors * 5)
         
-        # D2: Type Safety
-        r2 = subprocess.run(["mypy", str(self.project_path), "--ignore-missing-imports"],
-                          capture_output=True, text=True)
-        error_count = r2.stdout.count(": error:")
-        scores["D2_TypeSafety"] = max(0, 100 - error_count * 10)
+        # D2: Type Safety -遍歷所有 scan_paths
+        total_type_errors = 0
+        for path in self.scan_paths:
+            r2 = subprocess.run(["mypy", str(self.project_path / path), "--ignore-missing-imports"],
+                              capture_output=True, text=True)
+            total_type_errors += r2.stdout.count(": error:")
+        scores["D2_TypeSafety"] = max(0, 100 - total_type_errors * 10)
         
         # D3: Coverage (無法運行)
         scores["D3_Coverage"] = 0
         
-        # D4: Security
-        r4 = subprocess.run(["bandit", "-r", str(self.project_path), "-f", "json"],
-                          capture_output=True, text=True, timeout=30)
+        # D4: Security - 使用 AQG 遍歷所有 scan_paths
+        sys.path.insert(0, "/Users/johnny/agent-quality-guard-v2")
         try:
-            data = json.loads(r4.stdout)
-            high = data["metrics"]["_totals"]["SEVERITY.HIGH"]
-            medium = data["metrics"]["_totals"]["SEVERITY.MEDIUM"]
-            scores["D4_Security"] = max(0, 100 - high * 20 - medium * 10)
-        except:
-            scores["D4_Security"] = 100
+            from agent_quality_guard import AgentQualityGuard
+            guard = AgentQualityGuard()
+            total_critical = 0
+            total_warning = 0
+            for path in self.scan_paths:
+                reports = guard.scan_directory(str(self.project_path / path))
+                for r in reports:
+                    for issue in r.issues:
+                        if issue.severity == "critical":
+                            total_critical += 1
+                        elif issue.severity == "warning":
+                            total_warning += 1
+            scores["D4_Security"] = max(0, 100 - total_critical * 10 - total_warning * 2)
+        except Exception:
+            scores["D4_Security"] = 50
         
         # D5-D9: 預設分數
         scores["D5_Complexity"] = 80
@@ -832,11 +881,8 @@ for k, v in result.dimensions.items():
         """
         嘗試通用的代碼品質修復
         """
-        # 確保 src_path 已初始化
-        if not hasattr(self, 'src_path'):
-            self.src_path = self.project_path / "03-development" / "src"
-        if not self.src_path.exists():
-            print(f"   ⚠️ src_path 不存在: {self.src_path}")
+        if not self.scan_paths:
+            print(f"   ⚠️ scan_paths is empty")
             return False
         
         # 對於需要 Agent 的維度，嘗試基本修復
@@ -855,47 +901,53 @@ for k, v in result.dimensions.items():
     
     def _fix_type_annotations(self) -> bool:
         """嘗試修復類型註解問題"""
-        if not self.src_path.exists():
+        if not self.scan_paths:
             return False
         fixed_any = False
-        for py_file in self.src_path.rglob("*.py"):
-            content = py_file.read_text()
-            # 簡單檢查是否有 type annotations
-            if "def " in content and "->" not in content:
-                # 添加基本的返回類型
-                import re
-                new_content = re.sub(
-                    r'(def \w+\([^)]*\)):',
-                    r'\1 -> None:',
-                    content
-                )
-                if new_content != content:
-                    py_file.write_text(new_content)
-                    print(f"   ✅ {py_file.name}: 添加基本返回類型")
-                    fixed_any = True
+        for scan_path in self.scan_paths:
+            if not scan_path.exists():
+                continue
+            for py_file in scan_path.rglob("*.py"):
+                content = py_file.read_text()
+                # 簡單檢查是否有 type annotations
+                if "def " in content and "->" not in content:
+                    # 添加基本的返回類型
+                    import re
+                    new_content = re.sub(
+                        r'(def \w+\([^)]*\)):',
+                        r'\1 -> None:',
+                        content
+                    )
+                    if new_content != content:
+                        py_file.write_text(new_content)
+                        print(f"   ✅ {py_file.name}: 添加基本返回類型")
+                        fixed_any = True
         return fixed_any
     
     def _fix_security_issues(self) -> bool:
         """嘗試修復安全問題"""
-        if not self.src_path.exists():
+        if not self.scan_paths:
             return False
         fixed_any = False
-        for py_file in self.src_path.rglob("*.py"):
-            content = py_file.read_text()
-            # 檢查基本安全問題
-            if "eval(" in content:
-                import re
-                new_content = content.replace("eval(", "# 安全: eval removed ")
-                py_file.write_text(new_content)
-                print(f"   ✅ {py_file.name}: 移除不安全 eval")
-                fixed_any = True
-            if "os.system(" in content and "#" not in content.split("os.system")[0].split("\n")[-1]:
-                import re
-                new_content = re.sub(r'os\.system\([^)]+\)', '# 安全: os.system removed', content)
-                if new_content != content:
+        for scan_path in self.scan_paths:
+            if not scan_path.exists():
+                continue
+            for py_file in scan_path.rglob("*.py"):
+                content = py_file.read_text()
+                # 檢查基本安全問題
+                if "eval(" in content:
+                    import re
+                    new_content = content.replace("eval(", "# 安全: eval removed ")
                     py_file.write_text(new_content)
-                    print(f"   ✅ {py_file.name}: 標記不安全 os.system")
+                    print(f"   ✅ {py_file.name}: 移除不安全 eval")
                     fixed_any = True
+                if "os.system(" in content and "#" not in content.split("os.system")[0].split("\n")[-1]:
+                    import re
+                    new_content = re.sub(r'os\.system\([^)]+\)', '# 安全: os.system removed', content)
+                    if new_content != content:
+                        py_file.write_text(new_content)
+                        print(f"   ✅ {py_file.name}: 標記不安全 os.system")
+                        fixed_any = True
         return fixed_any
     
     def _fix_coverage_issue(self) -> bool:
