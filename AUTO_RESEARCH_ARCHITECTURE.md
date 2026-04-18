@@ -143,7 +143,7 @@ def cmd_run(args):
 | D6_Architecture | pydeps | 100 - cycles × 20 - cross_layer × 10 |
 | D7_Readability | grep | docstring檔案數 / 總檔案數 × 100 |
 | D8_ErrorHandling | grep | min(100, except_blocks × 10) |
-| D9_Documentation | grep | @param/@return/@raises 檔案數 / 總檔案數 × 100 |
+| D9_Documentation | grep | (docstring≥3行 或 ≥50字的檔案) / 總檔案數 × 100 |
 
 ---
 
@@ -233,6 +233,78 @@ pip install pydeps
 - 需要 package 有 `__init__.py`（Python 標準）
 - 跨層依賴需要人工定義「哪些是高層、哪些是低層」
 - 如果無法自動化，可用人工 audit 替代，count 問題數量
+
+---
+
+## D9_Documentation 公式詳解（2026-04-18 修正）
+
+### 為什麼舊公式有問題
+
+舊公式測 `@param/@return/@raises` 標籤：
+```
+D9_Documentation: @param/@return/@raises 檔案數 / 總檔案數 × 100
+```
+
+**問題：**
+- 強迫特定格式（@param、Google style、NumPy style）
+- 不在乎文件內容是否有用的實質
+- 格式合規 ≠ 文件有用
+
+### 新公式
+
+```
+D9_Documentation: (docstring ≥3行 或 ≥50字 的檔案) / 總檔案數 × 100
+```
+
+**「實質內容」定義：**
+| 條件 | 標準 |
+|------|------|
+| 行數標準 | docstring ≥ 3 行 |
+| 字數標準 | docstring ≥ 50 字 |
+| 滿足其一即可 | OR 邏輯 |
+
+**排除：**
+- `"""..."""` 或 `"""."""` 空白文件
+- 只有一行標題無說明
+- 只有 TODO/FIXME 佔位
+
+**納入：**
+- 3+ 行說明
+- 50+ 字的功能描述
+- 任何有意義的參數/返回值/用途說明（不限格式）
+
+### 範例
+
+```python
+# ❌ 空白文件（不納入）
+def foo(x):
+    """pass"""
+    pass
+
+# ❌ 只有一行（不納入）
+def bar(y):
+    """Handle bar."""
+    pass
+
+# ✅ ≥3行（納入）
+def baz(z):
+    """
+    Process baz.
+    Args:
+        z: input value
+    """
+    pass
+
+# ✅ ≥50字（納入）
+def qux(a, b):
+    """Calculate qux with given tolerance. Returns None on failure."""
+    pass
+```
+
+### 局限性
+
+- 行數/字數閾值是人為設定，可能需根據專案調整
+- 未來可加入「是否有 Args/Returns/Raises 說明」作為子維度
 
 ---
 
