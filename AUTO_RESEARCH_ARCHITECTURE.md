@@ -138,7 +138,7 @@ def cmd_run(args):
 | D1_Linting | ruff | 100 - errors × 5 |
 | D2_TypeSafety | mypy | 100 - errors × 10 |
 | D3_Coverage | pytest-cov | 實際覆蓋率 |
-| D4_Security | AQG | 100 - critical×10 - warning×2 |
+| D4_Secrets | detect-secrets | 100 - verified_secrets × 20 |
 | D5_Complexity | lizard | 100 - avg_cc × 5 |
 | D6_Architecture | pydeps | 100 - cycles × 20 - cross_layer × 10 |
 | D7_Readability | grep | docstring檔案數 / 總檔案數 × 100 |
@@ -263,10 +263,18 @@ D9_Documentation: (docstring ≥3行 或 ≥50字 的檔案) / 總檔案數 × 1
 | 字數標準 | docstring ≥ 50 字 |
 | 滿足其一即可 | OR 邏輯 |
 
-**排除：**
+**排除（structural files，不影響分數）：**
 - `"""..."""` 或 `"""."""` 空白文件
 - 只有一行標題無說明
 - 只有 TODO/FIXME 佔位
+- **Structural definition files**（enum, exception, interface 定義檔）:
+  - 命名本身就是文件，擴充沒有實際價值
+  - 例如：`enums.py`, `exceptions.py`, `__init__.py`
+  - 當前被排除的檔案（共 11 個）：
+    - `implement/governance/{enums,models,exceptions}.py`
+    - `implement/llm_cascade/{enums,exceptions}.py`
+    - `implement/mcp/{__init__,data_perimeter,saif_identity_middleware}.py`
+    - `implement/security/{prompt_shield,detection_modes,shield_enums}.py`
 
 **納入：**
 - 3+ 行說明
@@ -305,6 +313,46 @@ def qux(a, b):
 
 - 行數/字數閾值是人為設定，可能需根據專案調整
 - 未來可加入「是否有 Args/Returns/Raises 說明」作為子維度
+
+---
+
+## D4_Secrets 公式詳解（2026-04-18 修正）
+
+### 為什麼舊公式（AQG）無效
+
+AQG 的 D4 問題：
+- Critical: docstring 提到 `OPENAI_API_KEY` 被當成 hardcoded secret
+- Warning: "function too long" 被當成安全問題
+- 全部是 false positive，測的是「代碼質量」而非「安全」
+
+**Framework 的安全問題不是 SQLi/XSS，而是 credential leak。**
+
+### 新公式
+
+```
+D4_Secrets: 100 - verified_secrets × 20
+```
+
+**工具:** `detect-secrets`（inline scan，僅測當前 working directory）
+
+| 條件 | 分數 |
+|------|------|
+| 0 verified secrets | 100% |
+| 1 verified secret | 80% |
+| 2 verified secrets | 60% |
+| 3+ | 0% |
+
+**Scope:** 只測 `implement/` 五個 Feature 目錄
+
+**不掃:**
+- Git history（不掃 historical commits）
+- 文件目錄（如有假的 API key 範例）
+- Local config 檔案
+
+### 局限性
+
+- `is_verified: false` 的 findings 會被忽略
+- 文件中的假 key 不會造成扣分
 
 ---
 
