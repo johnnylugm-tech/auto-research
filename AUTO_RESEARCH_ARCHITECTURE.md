@@ -140,12 +140,99 @@ def cmd_run(args):
 | D3_Coverage | pytest-cov | 實際覆蓋率 |
 | D4_Security | AQG | 100 - critical×10 - warning×2 |
 | D5_Complexity | lizard | 100 - avg_cc × 5 |
-| D6_Architecture | radon | 100 - C_rank × 20 |
+| D6_Architecture | pydeps | 100 - cycles × 20 - cross_layer × 10 |
 | D7_Readability | grep | docstring檔案數 / 總檔案數 × 100 |
 | D8_ErrorHandling | grep | min(100, except_blocks × 10) |
 | D9_Documentation | grep | @param/@return/@raises 檔案數 / 總檔案數 × 100 |
 
 ---
+
+## D6_Architecture 公式詳解（2026-04-18 修正）
+
+### 為什麼舊公式無效
+
+舊公式用 `radon cc -a` 測「平均複雜度等级」：
+```
+D6_Architecture: 100 - C_rank × 20
+```
+
+**實際效果：**
+- avg grade A → 100分
+- avg grade B → 80分
+- avg grade C → 60分
+
+**這不是 architecture score，這是 complexity score 的另一種表達。**
+
+問題：
+- 一個爛架構可以全部是簡單函數（CC<10, grade A）→ 拿 100分
+- 一個好架構模組化佳但某個核心類調用鏈複雜（grade B）→ 拿 80分
+- 基本上是 binary：要嘛 100 要嘛 80，沒有區分度
+
+### Architecture 應該測什麼
+
+| 維度 | 測什麼 | 工具 |
+|------|--------|------|
+| D5 Complexity | 函數內部邏輯分支數 | radon/lizard (CC) |
+| **D6 Architecture** | **模組之間的依賴關係** | **pydeps (dep graph)** |
+
+Architecture 關心的核心問題：
+- 循環依賴 (A→B→C→A) → 架構高壓線
+- 跨層依賴 (高層直接依賴低層細節) → 違反分層原則
+- 扇出過高 (一個模組依賴20個) → 結構不良
+- 扇入過低 (某模組沒人用) → 可能是 dead code
+
+### 新公式
+
+```
+D6_Architecture: 100 - (cycles × 20) - (cross_layer × 10)
+```
+
+**工具：** `pydeps --no-show --format=dot <package>` 產生依賴圖
+
+| 問題類型 | 權重 | 說明 |
+|----------|------|------|
+| 循環依賴 (每個) | -20 | 模組之間形成環路，牽一髮動全身 |
+| 跨層依賴 (每個) | -10 | 高層業務邏輯直接依賴低層實作細節 |
+
+**扣分上限：** 最低 0 分（不鎖死）
+
+**評估方式：**
+```bash
+# 檢測循環依賴
+pydeps --no-show --format=cycles <package>
+
+# 檢測跨層依賴（需配合 layer config）
+# 例如：business.py 不應直接 import persistence/db.py 的細節
+```
+
+### 範例
+
+```
+Good Architecture (score=100):
+  governance/  → escalation_engine/
+  kill_switch/ → circuit_breaker/, state_manager/
+  (無循環，層次清晰)
+
+Bad Architecture (score=70):
+  governance_trigger.py ──imports──► api_clients/anthropic.py
+                                            ▲
+         models.py ──imports──────────────┘
+  (models → clients → governance 形成循環)
+  扣分: 1 cycle × 20 = -20, 3 cross_layer × 10 = -30
+  Score: 100 - 20 - 30 = 50
+```
+
+### pydeps 安裝
+
+```bash
+pip install pydeps
+```
+
+### 局限性
+
+- 需要 package 有 `__init__.py`（Python 標準）
+- 跨層依賴需要人工定義「哪些是高層、哪些是低層」
+- 如果無法自動化，可用人工 audit 替代，count 問題數量
 
 ---
 
